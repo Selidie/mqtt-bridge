@@ -66,7 +66,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 | `MQTT_PORT` | MQTT broker port | `1883` |
 | `MQTT_USER` | MQTT username (leave blank if none) | `` |
 | `MQTT_PASS` | MQTT password (leave blank if none) | `` |
-| `MQTT_PREFIX` | Topic prefix to subscribe to | `<your_broker>` |
+| `MQTT_PREFIX` | Topic prefix to subscribe to | `solar_assistant` |
 | `MQTT_CLIENT_ID` | MQTT client identifier | `mqtt-bridge` |
 | `PORT` | HTTP API port | `5003` |
 | `LOG_LEVEL` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) | `INFO` |
