@@ -2,7 +2,7 @@
 
 A lightweight MQTT subscriber that connects to the Solar Assistant broker, caches all published topic values in memory, and exposes them via a simple HTTP API. Designed to run as a Docker container alongside other home automation services.
 
-Part of a home automation stack alongside [tuya-bridge](https://github.com/Selidie/tuya-bridge), [fan-controller](https://github.com/Selidie/fan-controller) and [tuya-dashboard](https://github.com/Selidie/tuya-dashboard).
+Part of a home automation stack alongside [tuya-bridge](https://github.com/Selidie/tuya-bridge), [fan-controller](https://github.com/Selidie/fan-controller) and [home-dashboard](https://github.com/Selidie/home-dashboard).
 
 ---
 
@@ -136,7 +136,7 @@ Solar Assistant MQTT Broker
          │ HTTP
          ▼
   ┌──────────────────┐
-  │  tuya-dashboard  │  polls /topics or /summary, renders widgets
+  │  home-dashboard  │  polls /topics or /summary, renders widgets
   └──────────────────┘
 ```
 
@@ -146,4 +146,4 @@ Solar Assistant MQTT Broker
 
 - [tuya-bridge](https://github.com/Selidie/tuya-bridge) — HTTP API gateway for Tuya smart devices
 - [fan-controller](https://github.com/Selidie/fan-controller) — MQTT temperature-driven fan automation
-- [tuya-dashboard](https://github.com/Selidie/tuya-dashboard) — Web UI for monitoring and control
+- [home-dashboard](https://github.com/Selidie/home-dashboard) — Web UI for monitoring and control
