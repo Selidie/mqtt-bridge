@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""mqtt-bridge — Subscribe to Solar Assistant MQTT topics and expose them via HTTP API."""
+"""mqtt-bridge — Subscribe to Solar Assistant MQTT topics and expose them via HTTP API.
+
+Optionally writes numeric topic values to InfluxDB for time-series history.
+Set INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, and INFLUX_BUCKET in .env to enable.
+Leave INFLUX_URL unset to run without InfluxDB (safe default).
+"""
 import os
 import json
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
-from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
@@ -20,7 +25,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# MQTT config
 # ---------------------------------------------------------------------------
 MQTT_HOST      = os.environ.get('MQTT_HOST', '192.168.50.22')
 MQTT_PORT      = int(os.environ.get('MQTT_PORT', '1883'))
@@ -31,7 +36,38 @@ MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'mqtt-bridge')
 API_PORT       = int(os.environ.get('PORT', '5003'))
 
 # ---------------------------------------------------------------------------
-# Topic store
+# InfluxDB config — all optional, writes disabled if INFLUX_URL is unset
+# ---------------------------------------------------------------------------
+INFLUX_URL    = os.environ.get('INFLUX_URL', '').strip()
+INFLUX_TOKEN  = os.environ.get('INFLUX_TOKEN', '').strip()
+INFLUX_ORG    = os.environ.get('INFLUX_ORG', 'home')
+INFLUX_BUCKET = os.environ.get('INFLUX_BUCKET', 'solar')
+
+# ---------------------------------------------------------------------------
+# InfluxDB client setup
+# influx_write_api and influx_query_api are None when InfluxDB is disabled.
+# ---------------------------------------------------------------------------
+influx_write_api = None
+influx_query_api = None
+_influx_client   = None
+
+if INFLUX_URL and INFLUX_TOKEN:
+    try:
+        from influxdb_client import InfluxDBClient
+        from influxdb_client.client.write_api import SYNCHRONOUS
+        _influx_client   = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+        influx_write_api = _influx_client.write_api(write_options=SYNCHRONOUS)
+        influx_query_api = _influx_client.query_api()
+        log.info('InfluxDB enabled → %s  bucket=%s  org=%s', INFLUX_URL, INFLUX_BUCKET, INFLUX_ORG)
+    except Exception as e:
+        log.error('Failed to initialise InfluxDB client: %s — writes disabled', e)
+        influx_write_api = None
+        influx_query_api = None
+else:
+    log.info('InfluxDB write disabled (INFLUX_URL or INFLUX_TOKEN not set)')
+
+# ---------------------------------------------------------------------------
+# Topic store — latest value per topic, in memory
 # ---------------------------------------------------------------------------
 store_lock  = threading.Lock()
 topic_store = {}
@@ -66,6 +102,24 @@ def get_topic(path):
     return None
 
 
+def get_numeric_topics():
+    """Return list of short topic names (prefix stripped) that have numeric values.
+    Used by the graph config UI to populate the topic picker.
+    """
+    result = []
+    with store_lock:
+        for topic, data in topic_store.items():
+            if not topic.endswith('/state'):
+                continue
+            try:
+                float(data['value'])
+            except (ValueError, TypeError):
+                continue
+            short = topic[len(MQTT_PREFIX) + 1:] if topic.startswith(MQTT_PREFIX + '/') else topic
+            result.append(short)
+    return sorted(result)
+
+
 def build_tree():
     """Convert flat topic dict into a nested tree for easy consumption."""
     tree = {}
@@ -78,6 +132,110 @@ def build_tree():
             node = node.setdefault(part, {})
         node[parts[-1]] = data
     return tree
+
+
+# ---------------------------------------------------------------------------
+# InfluxDB write helper
+# ---------------------------------------------------------------------------
+def write_to_influx(topic: str, value: str, ts: datetime):
+    """Write a single numeric MQTT reading to InfluxDB. No-op if disabled."""
+    if influx_write_api is None:
+        return
+    if not topic.endswith('/state'):
+        return
+    try:
+        float_val = float(value)
+    except (ValueError, TypeError):
+        return
+    short_topic = topic[len(MQTT_PREFIX) + 1:] if topic.startswith(MQTT_PREFIX + '/') else topic
+    try:
+        from influxdb_client import Point
+        point = (
+            Point('solar')
+            .tag('topic', short_topic)
+            .tag('prefix', MQTT_PREFIX)
+            .field('value', float_val)
+            .time(ts.replace(tzinfo=timezone.utc))
+        )
+        influx_write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+        log.debug('InfluxDB write: %s = %s', short_topic, float_val)
+    except Exception as e:
+        log.warning('InfluxDB write failed for %s: %s', topic, e)
+
+
+# ---------------------------------------------------------------------------
+# InfluxDB history query
+#
+# GET /history?topics=a,b,c&range=24h&window=1m
+#
+# topics  — comma-separated short topic names (prefix already stripped)
+# range   — Flux duration string: 24h (default), 6h, 7d, etc.
+# window  — aggregation window: raw (default, no downsampling), 1m, 5m, 1h
+#
+# Returns:
+# {
+#   "success": true,
+#   "range": "24h",
+#   "window": "raw",
+#   "series": {
+#     "inverter_1/pv_power/state": [
+#       { "time": 1234567890, "value": 1250.0 }, ...
+#     ],
+#     ...
+#   }
+# }
+# ---------------------------------------------------------------------------
+def query_history(topics: list, range_str: str = '24h', window: str = 'raw') -> dict:
+    """Query InfluxDB for historical data for one or more topics."""
+    if influx_query_api is None:
+        return {'success': False, 'error': 'InfluxDB not enabled'}
+    if not topics:
+        return {'success': False, 'error': 'No topics specified'}
+
+    # Build a Flux filter for the requested topics
+    topic_filters = ' or '.join([f'r["topic"] == "{t}"' for t in topics])
+
+    if window == 'raw' or not window:
+        flux = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{range_str})
+  |> filter(fn: (r) => r["_measurement"] == "solar" and r["_field"] == "value")
+  |> filter(fn: (r) => {topic_filters})
+  |> keep(columns: ["_time", "_value", "topic"])
+  |> sort(columns: ["_time"])
+'''
+    else:
+        flux = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{range_str})
+  |> filter(fn: (r) => r["_measurement"] == "solar" and r["_field"] == "value")
+  |> filter(fn: (r) => {topic_filters})
+  |> aggregateWindow(every: {window}, fn: mean, createEmpty: false)
+  |> keep(columns: ["_time", "_value", "topic"])
+  |> sort(columns: ["_time"])
+'''
+
+    try:
+        tables  = influx_query_api.query(flux, org=INFLUX_ORG)
+        series  = {}
+        for table in tables:
+            for record in table.records:
+                topic = record.values.get('topic', 'unknown')
+                if topic not in series:
+                    series[topic] = []
+                series[topic].append({
+                    'time':  int(record.get_time().timestamp()),
+                    'value': record.get_value()
+                })
+        return {
+            'success': True,
+            'range':   range_str,
+            'window':  window,
+            'series':  series
+        }
+    except Exception as e:
+        log.warning('InfluxDB history query failed: %s', e)
+        return {'success': False, 'error': str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -105,10 +263,12 @@ def on_disconnect(client, userdata, rc):
 def on_message(client, userdata, msg):
     try:
         value = msg.payload.decode('utf-8').strip()
+        now   = datetime.now()
         set_topic(msg.topic, value)
+        write_to_influx(msg.topic, value, now)
         log.debug('Topic update: %s = %s', msg.topic, value)
     except Exception as e:
-        log.warning('Failed to decode message on %s: %s', msg.topic, e)
+        log.warning('Failed to process message on %s: %s', msg.topic, e)
 
 
 # ---------------------------------------------------------------------------
@@ -129,18 +289,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path   = parsed.path.rstrip('/')
-        parts  = [p for p in path.split('/') if p]
+        parsed  = urlparse(self.path)
+        path    = parsed.path.rstrip('/')
+        parts   = [p for p in path.split('/') if p]
+        qs      = parse_qs(parsed.query)
 
         # GET /health
         if path == '/health':
             return self.send_json(200, {
-                'status':         'ok',
-                'mqtt_connected': mqtt_connected,
-                'topic_count':    len(topic_store),
-                'broker':         f'{MQTT_HOST}:{MQTT_PORT}',
-                'prefix':         MQTT_PREFIX
+                'status':          'ok',
+                'mqtt_connected':  mqtt_connected,
+                'topic_count':     len(topic_store),
+                'broker':          f'{MQTT_HOST}:{MQTT_PORT}',
+                'prefix':          MQTT_PREFIX,
+                'influx_enabled':  influx_write_api is not None,
             })
 
         # GET /topics — full flat dict of all topics and their latest values
@@ -160,9 +322,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 'tree':           build_tree()
             })
 
+        # GET /topics/numeric — short names of all topics with numeric values
+        # Used by the graph config modal to populate the topic picker.
+        if path == '/topics/numeric':
+            return self.send_json(200, {
+                'success': True,
+                'topics':  get_numeric_topics()
+            })
+
         # GET /topics/{path...} — single topic value
-        # e.g. /topics/solar_assistant/inverter_1/temperature/state
-        #   or /topics/inverter_1/temperature/state  (prefix auto-added)
         if parts and parts[0] == 'topics' and len(parts) > 1:
             topic_path = '/'.join(parts[1:])
             result = get_topic(topic_path)
@@ -200,6 +368,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 'summary':        summary
             })
 
+        # GET /history?topics=a,b&range=24h&window=raw
+        if path == '/history':
+            if influx_query_api is None:
+                return self.send_json(503, {'success': False, 'error': 'InfluxDB not enabled'})
+            topics_raw = qs.get('topics', [''])[0]
+            topics     = [t.strip() for t in topics_raw.split(',') if t.strip()]
+            range_str  = qs.get('range',  ['24h'])[0]
+            window     = qs.get('window', ['raw'])[0]
+            result     = query_history(topics, range_str, window)
+            code       = 200 if result.get('success') else 500
+            return self.send_json(code, result)
+
         self.send_json(404, {'error': 'Unknown endpoint'})
 
 
@@ -216,11 +396,9 @@ def main():
     log.info('MQTT Bridge starting')
     log.info('Broker: %s:%d  Prefix: %s', MQTT_HOST, MQTT_PORT, MQTT_PREFIX)
 
-    # Start HTTP API in background thread
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
 
-    # Connect to MQTT and loop forever
     client = mqtt.Client(client_id=MQTT_CLIENT_ID)
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
