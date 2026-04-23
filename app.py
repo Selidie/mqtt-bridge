@@ -75,6 +75,9 @@ topic_store = {}
 
 mqtt_connected = False
 
+# Global MQTT client reference — set in main() so the HTTP handler can publish
+mqtt_client_ref = None
+
 
 def set_topic(topic, value):
     now = datetime.now()
@@ -382,6 +385,32 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         self.send_json(404, {'error': 'Unknown endpoint'})
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip('/')
+
+        # POST /publish  — publish a value to an MQTT topic
+        # Body: { "topic": "solar_assistant/inverter_1/time_point_1/set", "value": "06:00" }
+        if path == '/publish':
+            if not mqtt_connected or mqtt_client_ref is None:
+                return self.send_json(503, {'success': False, 'error': 'MQTT not connected'})
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body   = json.loads(self.rfile.read(length))
+                topic  = body.get('topic', '').strip()
+                value  = str(body.get('value', '')).strip()
+                if not topic or value == '':
+                    return self.send_json(400, {'success': False, 'error': 'topic and value are required'})
+                result = mqtt_client_ref.publish(topic, value, qos=1, retain=False)
+                result.wait_for_publish(timeout=5)
+                log.info('Published: %s = %s', topic, value)
+                return self.send_json(200, {'success': True, 'topic': topic, 'value': value})
+            except Exception as e:
+                log.warning('Publish failed: %s', e)
+                return self.send_json(500, {'success': False, 'error': str(e)})
+
+        self.send_json(404, {'error': 'Unknown endpoint'})
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -399,6 +428,7 @@ def main():
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
 
+    global mqtt_client_ref
     client = mqtt.Client(client_id=MQTT_CLIENT_ID)
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
@@ -406,6 +436,7 @@ def main():
     client.on_disconnect = on_disconnect
     client.on_message    = on_message
     client.reconnect_delay_set(min_delay=5, max_delay=60)
+    mqtt_client_ref = client
 
     try:
         client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
