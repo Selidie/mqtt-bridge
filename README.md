@@ -28,7 +28,7 @@ Part of a home automation stack alongside [tuya-bridge](https://github.com/Selid
 | `GET /topics/numeric` | Short names of all topics with numeric values (used by chart config UI) |
 | `GET /topics/{path}` | Single topic value (prefix optional) |
 | `GET /summary` | Curated key solar values by friendly label |
-| `GET /history` | Time-series history
+| `GET /history` | Time-series history from InfluxDB (requires InfluxDB enabled) |
 | `GET /energy-history` | Half-hourly grid import kWh for a given date (requires InfluxDB enabled) |
 
 ### Example responses
