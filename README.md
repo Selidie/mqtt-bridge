@@ -14,6 +14,7 @@ Part of a home automation stack alongside [tuya-bridge](https://github.com/Selid
 - New topics appear automatically as Solar Assistant publishes them — no code changes needed
 - **InfluxDB integration** — optionally writes every numeric `/state` topic to InfluxDB 2.x for time-series history and graphing. Disabled by default; set `INFLUX_URL` and `INFLUX_TOKEN` to enable.
 - **History endpoint** — queries InfluxDB for historical data with configurable time range and aggregation window, consumed by the home-dashboard chart UI
+- **Energy history endpoint** — queries InfluxDB for half-hourly grid import totals for a specific date, used by the home-dashboard Electricity Usage page. Export (negative CT values) is clamped to zero. Returns kWh per 30-minute slot aligned to `Europe/London` local time.
 
 ---
 
@@ -27,7 +28,8 @@ Part of a home automation stack alongside [tuya-bridge](https://github.com/Selid
 | `GET /topics/numeric` | Short names of all topics with numeric values (used by chart config UI) |
 | `GET /topics/{path}` | Single topic value (prefix optional) |
 | `GET /summary` | Curated key solar values by friendly label |
-| `GET /history` | Time-series history from InfluxDB (requires InfluxDB enabled) |
+| `GET /history` | Time-series history
+| `GET /energy-history` | Half-hourly grid import kWh for a given date (requires InfluxDB enabled) |
 
 ### Example responses
 
@@ -79,6 +81,35 @@ Part of a home automation stack alongside [tuya-bridge](https://github.com/Selid
 | `topics` | Comma-separated short topic names (prefix already stripped) | required |
 | `range` | Flux duration string: `1h`, `6h`, `24h`, `7d`, etc. | `24h` |
 | `window` | Aggregation window: `raw` (no downsampling), `1m`, `5m`, `1h`, etc. | `raw` |
+
+### Energy history query parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `date` | Date to query in `YYYY-MM-DD` format (Europe/London local time) | today |
+
+**Example response:**
+
+**`GET /energy-history?date=2026-05-10`**
+```json
+{
+  "success": true,
+  "date": "2026-05-10",
+  "slots": [
+    {
+      "interval_start": "2026-05-10T00:00:00+01:00",
+      "interval_end":   "2026-05-10T00:30:00+01:00",
+      "consumption_kwh": 0.1423
+    },
+    ...
+  ]
+}
+```
+
+- Uses `inverter_1/grid_power_ct/state` (CT clamp reading, Watts)
+- Aggregates via `aggregateWindow(every: 30m, fn: mean)`, converts mean watts to kWh (`watts × 0.5 / 1000`)
+- Negative values (grid export) are clamped to zero — import only
+- InfluxDB timestamps are window-end; response returns corrected `interval_start` (window-end minus 30 minutes) to align with Octopus API conventions
 
 ---
 
@@ -181,9 +212,9 @@ Solar Assistant MQTT Broker
         │
         │  subscribe to solar_assistant/#
         ▼
-  ┌─────────────┐
-  │ mqtt-bridge │  in-memory topic cache
-  │             │
+  ┌──────────────────┐
+  │ mqtt-bridge      │  in-memory topic cache
+  │                  │
   │  /health         │
   │  /topics         │
   │  /topics/tree    │
@@ -191,9 +222,10 @@ Solar Assistant MQTT Broker
   │  /topics/{path}  │
   │  /summary        │
   │  /history        │  ◄── queries InfluxDB
-  └──────┬──────┘
+  │  /energy-history │  ◄── queries InfluxDB (half-hourly kWh, date-scoped)
+  └──────┬───────────┘
          │               │
-         │ HTTP           │ write numeric /state topics
+         │ HTTP          │ write numeric /state topics
          ▼               ▼
   ┌──────────────┐   ┌──────────┐
   │home-dashboard│   │ InfluxDB │
@@ -206,4 +238,4 @@ Solar Assistant MQTT Broker
 
 - [tuya-bridge](https://github.com/Selidie/tuya-bridge) — HTTP API gateway for Tuya smart devices
 - [fan-controller](https://github.com/Selidie/fan-controller) — MQTT temperature-driven fan automation
-- [home-dashboard](https://github.com/Selidie/home-dashboard) — Web UI for monitoring, control, and solar history charts
+- [home-dashboard](https://github.com/Selidie/home-dashboard) — Web UI for monitoring, control, solar history charts, and electricity usage comparison
