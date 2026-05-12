@@ -242,6 +242,100 @@ from(bucket: "{INFLUX_BUCKET}")
 
 
 # ---------------------------------------------------------------------------
+# Energy history query — half-hourly grid import kWh for a single date
+# ---------------------------------------------------------------------------
+def query_energy_history(date_str: str) -> dict:
+    """
+    Query InfluxDB for half-hourly grid import totals for a given date.
+
+    date_str: 'YYYY-MM-DD' in local time (Europe/London). If empty, defaults
+              to today. Converts to UTC range before querying.
+
+    Returns:
+    {
+      "success": true,
+      "date": "2025-05-12",
+      "slots": [
+        { "interval_start": "2025-05-12T00:00:00+01:00",
+          "interval_end":   "2025-05-12T00:30:00+01:00",
+          "consumption_kwh": 0.142 },
+        ...
+      ]
+    }
+
+    grid_power_ct/state is in Watts, sampled roughly every second via MQTT.
+    aggregateWindow(every:30m, fn:mean) gives mean watts for each window.
+    kWh = mean_watts * 0.5 / 1000   (0.5 = half an hour)
+    Negative values (grid export) are clamped to zero.
+    """
+    import zoneinfo
+    from datetime import date as _date
+
+    if influx_query_api is None:
+        return {'success': False, 'error': 'InfluxDB not enabled'}
+
+    LOCAL_TZ = zoneinfo.ZoneInfo('Europe/London')
+
+    # Parse or default the date
+    try:
+        if date_str:
+            local_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        else:
+            local_date = datetime.now(LOCAL_TZ).date()
+    except ValueError:
+        return {'success': False, 'error': f'Invalid date format: {date_str!r} — use YYYY-MM-DD'}
+
+    # Build UTC range covering the full local day (handles BST/GMT correctly)
+    day_start_local = datetime(local_date.year, local_date.month, local_date.day,
+                               0, 0, 0, tzinfo=LOCAL_TZ)
+    day_end_local   = datetime(local_date.year, local_date.month, local_date.day,
+                               23, 59, 59, tzinfo=LOCAL_TZ)
+
+    start_utc = day_start_local.astimezone(timezone.utc)
+    end_utc   = day_end_local.astimezone(timezone.utc)
+
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    short_topic = f'inverter_1/grid_power_ct/state'
+
+    flux = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: {start_str}, stop: {end_str})
+  |> filter(fn: (r) => r["_measurement"] == "solar" and r["_field"] == "value")
+  |> filter(fn: (r) => r["topic"] == "{short_topic}")
+  |> aggregateWindow(every: 30m, fn: mean, createEmpty: false)
+  |> keep(columns: ["_time", "_value"])
+  |> sort(columns: ["_time"])
+'''
+
+    try:
+        tables = influx_query_api.query(flux, org=INFLUX_ORG)
+        slots  = []
+        for table in tables:
+            for record in table.records:
+                t       = record.get_time()                          # UTC datetime
+                t_local = t.astimezone(LOCAL_TZ)
+                end_t   = t_local + __import__('datetime').timedelta(minutes=30)
+                watts   = record.get_value() or 0.0
+                # Clamp export (negative) to zero — we only count import
+                kwh     = max(0.0, watts * 0.5 / 1000.0)
+                slots.append({
+                    'interval_start':   t_local.isoformat(),
+                    'interval_end':     end_t.isoformat(),
+                    'consumption_kwh':  round(kwh, 4),
+                })
+        return {
+            'success': True,
+            'date':    local_date.isoformat(),
+            'slots':   slots,
+        }
+    except Exception as e:
+        log.warning('energy-history query failed: %s', e)
+        return {'success': False, 'error': str(e)}
+
+
+# ---------------------------------------------------------------------------
 # MQTT callbacks
 # ---------------------------------------------------------------------------
 def on_connect(client, userdata, flags, rc):
@@ -381,6 +475,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
             window     = qs.get('window', ['raw'])[0]
             result     = query_history(topics, range_str, window)
             code       = 200 if result.get('success') else 500
+            return self.send_json(code, result)
+
+        # GET /energy-history?date=YYYY-MM-DD
+        # Returns 48 half-hourly grid import kWh slots for the given date.
+        # Negative values (export) are clamped to zero.
+        if path == '/energy-history':
+            if influx_query_api is None:
+                return self.send_json(503, {'success': False, 'error': 'InfluxDB not enabled'})
+            date_str = qs.get('date', [''])[0].strip()
+            result   = query_energy_history(date_str)
+            code     = 200 if result.get('success') else (400 if 'invalid' in result.get('error','').lower() else 500)
             return self.send_json(code, result)
 
         self.send_json(404, {'error': 'Unknown endpoint'})
