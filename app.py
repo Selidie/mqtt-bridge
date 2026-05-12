@@ -314,15 +314,15 @@ from(bucket: "{INFLUX_BUCKET}")
         slots  = []
         for table in tables:
             for record in table.records:
-                t       = record.get_time()                          # UTC datetime
+                t       = record.get_time()                          # UTC datetime — this is window END
                 t_local = t.astimezone(LOCAL_TZ)
-                end_t   = t_local + __import__('datetime').timedelta(minutes=30)
+                start_t = t_local - __import__('datetime').timedelta(minutes=30)
                 watts   = record.get_value() or 0.0
                 # Clamp export (negative) to zero — we only count import
                 kwh     = max(0.0, watts * 0.5 / 1000.0)
                 slots.append({
-                    'interval_start':   t_local.isoformat(),
-                    'interval_end':     end_t.isoformat(),
+                    'interval_start':   start_t.isoformat(),
+                    'interval_end':     t_local.isoformat(),
                     'consumption_kwh':  round(kwh, 4),
                 })
         return {
