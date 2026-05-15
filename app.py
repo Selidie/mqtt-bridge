@@ -311,24 +311,29 @@ from(bucket: "{INFLUX_BUCKET}")
 
     try:
         tables = influx_query_api.query(flux, org=INFLUX_ORG)
-        slots  = []
+        import_slots = []
+        export_slots = []
         for table in tables:
             for record in table.records:
                 t       = record.get_time()                          # UTC datetime — this is window END
                 t_local = t.astimezone(LOCAL_TZ)
                 start_t = t_local - __import__('datetime').timedelta(minutes=30)
                 watts   = record.get_value() or 0.0
-                # Clamp export (negative) to zero — we only count import
-                kwh     = max(0.0, watts * 0.5 / 1000.0)
-                slots.append({
-                    'interval_start':   start_t.isoformat(),
-                    'interval_end':     t_local.isoformat(),
-                    'consumption_kwh':  round(kwh, 4),
-                })
+                # Import: clamp export (negative) to zero
+                import_kwh = max(0.0, watts * 0.5 / 1000.0)
+                # Export: clamp import (positive) to zero, return as positive kWh value
+                export_kwh = max(0.0, -watts * 0.5 / 1000.0)
+                slot = {
+                    'interval_start': start_t.isoformat(),
+                    'interval_end':   t_local.isoformat(),
+                }
+                import_slots.append({**slot, 'consumption_kwh': round(import_kwh, 4)})
+                export_slots.append({**slot, 'consumption_kwh': round(export_kwh, 4)})
         return {
-            'success': True,
-            'date':    local_date.isoformat(),
-            'slots':   slots,
+            'success':       True,
+            'date':          local_date.isoformat(),
+            'slots':         import_slots,   # backward-compatible — import only
+            'export_slots':  export_slots,
         }
     except Exception as e:
         log.warning('energy-history query failed: %s', e)
